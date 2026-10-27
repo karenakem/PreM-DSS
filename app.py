@@ -521,80 +521,87 @@ def page_header(title, subtitle, eyebrow="PreM-DSS"):
 # 2. LOAD DATA FROM SQLITE DATABASE
 # ==================================================
 
-connection = sqlite3.connect(DATABASE_PATH)
+@st.cache_data(show_spinner=False)
+def load_machine_data(database_signature):
+    # Signature invalidates the cache when the SQLite file changes.
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        return pd.read_sql_query("SELECT * FROM machine_data", connection)
 
-query = """
-SELECT *
-FROM machine_data
-"""
 
-df = pd.read_sql_query(
-    query,
-    connection
-)
+def database_signature():
+    # Stable across engineer-decision writes; restart/redeploy after changing source data.
+    return "machine_data_v1"
 
-connection.close()
 
-# ==================================================
-# 3. TRAIN PREDICTION MODEL FOR APPLICATION
-# ==================================================
+df = load_machine_data(database_signature())
 
-feature_columns = [
-    "Type",
-    "Air temperature [K]",
-    "Process temperature [K]",
-    "Rotational speed [rpm]",
-    "Torque [Nm]",
-    "Tool wear [min]"
-]
+# Train once per dataset version, rather than on every Streamlit rerun.
+@st.cache_resource(show_spinner="Preparing LightGBM model...")
+def prepare_lightgbm_model(database_version):
+    training_df = load_machine_data(database_version)
+    feature_columns = [
+        "Type",
+        "Air temperature [K]",
+        "Process temperature [K]",
+        "Rotational speed [rpm]",
+        "Torque [Nm]",
+        "Tool wear [min]"
+    ]
 
-X = df[feature_columns].copy()
+    X = training_df[feature_columns].copy()
 
-y = df["Machine failure"]
+    y = training_df["Machine failure"]
 
-# One-hot encode product type
-X_encoded = pd.get_dummies(
-    X,
-    columns=["Type"],
-    dtype=int
-)
+    # One-hot encode product type
+    X_encoded = pd.get_dummies(
+        X,
+        columns=["Type"],
+        dtype=int
+    )
 
-# Rename columns to safe feature names
-X_encoded = X_encoded.rename(
-    columns={
-        "Air temperature [K]": "Air_temperature",
-        "Process temperature [K]": "Process_temperature",
-        "Rotational speed [rpm]": "Rotational_speed",
-        "Torque [Nm]": "Torque",
-        "Tool wear [min]": "Tool_wear"
-    }
-)
+    # Rename columns to safe feature names
+    X_encoded = X_encoded.rename(
+        columns={
+            "Air temperature [K]": "Air_temperature",
+            "Process temperature [K]": "Process_temperature",
+            "Rotational speed [rpm]": "Rotational_speed",
+            "Torque [Nm]": "Torque",
+            "Tool wear [min]": "Tool_wear"
+        }
+    )
 
-# Same 90/10 split used in our experiments
-X_train, X_test, y_train, y_test = train_test_split(
-    X_encoded,
-    y,
-    test_size=0.10,
-    random_state=42,
-    stratify=y
-)
+    # Same 90/10 split used in our experiments
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_encoded,
+        y,
+        test_size=0.10,
+        random_state=42,
+        stratify=y
+    )
 
-# Create LightGBM model
-model = LGBMClassifier(
-    n_estimators=200,
-    learning_rate=0.05,
-    max_depth=-1,
-    random_state=42,
-    class_weight="balanced",
-    verbosity=-1,
-    n_jobs=-1
-)
+    # Create LightGBM model
+    model = LGBMClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=-1,
+        random_state=42,
+        class_weight="balanced",
+        verbosity=-1,
+        n_jobs=2
+    )
 
-# Train model
-model.fit(
-    X_train,
-    y_train
-)
+    # Train model
+    model.fit(
+        X_train,
+        y_train
+    )
+    y_prob = model.predict_proba(X_test)[:, 1]
+
+    return model, X_train, X_test, y_train, y_test, y_prob
+
+
+model, X_train, X_test, y_train, y_test, y_prob = prepare_lightgbm_model(database_signature())
+
 # ==========================================
 # LIGHTGBM MODEL VALIDATION
 # ==========================================
@@ -607,71 +614,8 @@ from sklearn.metrics import (
     confusion_matrix
 )
 
-# Predict failure probabilities on unseen test data
-y_prob = model.predict_proba(X_test)[:, 1]
-
-# Evaluate the standard 50% threshold
-y_pred_50 = (y_prob >= 0.50).astype(int)
-
-print("\n===== LIGHTGBM MODEL VALIDATION =====")
-
-print("Accuracy:", accuracy_score(y_test, y_pred_50))
-print("Precision:", precision_score(y_test, y_pred_50, zero_division=0))
-print("Recall:", recall_score(y_test, y_pred_50, zero_division=0))
-print("F1-score:", f1_score(y_test, y_pred_50, zero_division=0))
-
-print("Confusion Matrix:")
-print(confusion_matrix(y_test, y_pred_50))
-
-# Evaluate our existing 40% maintenance-alert threshold
-y_pred_40 = (y_prob >= 0.40).astype(int)
-
-print("\n===== LIGHTGBM AT 40% ALERT THRESHOLD =====")
-print("Precision:", precision_score(y_test, y_pred_40, zero_division=0))
-print("Recall:", recall_score(y_test, y_pred_40, zero_division=0))
-print("F1-score:", f1_score(y_test, y_pred_40, zero_division=0))
-print("Confusion Matrix:")
-print(confusion_matrix(y_test, y_pred_40))
-
-# ==========================================
-# LIGHTGBM THRESHOLD COMPARISON
-# ==========================================
-
-print("\n===== LIGHTGBM THRESHOLD COMPARISON =====")
-
-for threshold in [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
-    predictions = (y_prob >= threshold).astype(int)
-
-    tn, fp, fn, tp = confusion_matrix(
-        y_test, predictions
-    ).ravel()
-
-    precision = precision_score(
-        y_test, predictions, zero_division=0
-    )
-
-    recall = recall_score(
-        y_test, predictions, zero_division=0
-    )
-
-    f1 = f1_score(
-        y_test, predictions, zero_division=0
-    )
-
-    print(
-        f"Threshold: {threshold:.0%} | "
-        f"Detected: {tp} | "
-        f"Missed: {fn} | "
-        f"False Alarms: {fp} | "
-        f"Precision: {precision:.2%} | "
-        f"Recall: {recall:.2%} | "
-        f"F1: {f1:.2%}"
-    )
-# Shared prototype alert policy and dynamically computed evaluation.
-# The 60% setting is exploratory; a separate validation set is needed
-# before treating the threshold choice as independently validated.
+# Provisional alert threshold; the test-set comparison is exploratory.
 ALERT_THRESHOLD = 0.60
-
 
 def risk_category(probability_percent):
     if probability_percent < 20:
@@ -2056,13 +2000,17 @@ elif page == "Live Monitoring":
 
     # Prefer the existing historical monitoring records; fall back to the AI4I table
     # if the monitoring table is missing. Neither source is live sensor telemetry.
-    try:
-        with sqlite3.connect(DATABASE_PATH) as replay_connection:
-            replay_df = pd.read_sql_query(
-                "SELECT * FROM realtime_monitoring ORDER BY id ASC", replay_connection
-            )
-    except (sqlite3.Error, pd.errors.DatabaseError):
-        replay_df = pd.DataFrame()
+    @st.cache_data(show_spinner=False)
+    def load_replay_observations(database_version):
+        try:
+            with sqlite3.connect(DATABASE_PATH) as replay_connection:
+                return pd.read_sql_query(
+                    "SELECT * FROM realtime_monitoring ORDER BY id ASC", replay_connection
+                )
+        except (sqlite3.Error, pd.errors.DatabaseError):
+            return pd.DataFrame()
+
+    replay_df = load_replay_observations(database_signature())
 
     required_replay_columns = [
         "product_type", "air_temperature", "process_temperature",
@@ -2099,7 +2047,11 @@ elif page == "Live Monitoring":
             "Type_L": (replay_df["product_type"] == "L").astype(int),
             "Type_M": (replay_df["product_type"] == "M").astype(int),
         })[X_train.columns]
-        replay_probabilities = model.predict_proba(replay_features)[:, 1]
+        @st.cache_data(show_spinner=False)
+        def score_replay_observations(database_version, _features):
+            return model.predict_proba(_features)[:, 1]
+
+        replay_probabilities = score_replay_observations(database_signature(), replay_features)
         replay_df["failure_probability"] = replay_probabilities * 100
         replay_df["risk_level"] = [risk_category(p) for p in replay_df["failure_probability"]]
         replay_df["maintenance_alert"] = [
@@ -2147,7 +2099,7 @@ elif page == "Live Monitoring":
                 st.session_state.factory_skip_first_tick = False
         with control4:
             speed_seconds = st.selectbox(
-                "Seconds per observation", [2, 3, 5], index=1,
+                "Seconds per observation", [5, 10, 15], index=1,
                 help="Automatic replay speed; one historical observation per interval."
             )
 
@@ -2159,7 +2111,7 @@ elif page == "Live Monitoring":
 
         # Streamlit fragments rerun this part automatically without a button click.
         # A stopped simulation still redraws but never advances its observation index.
-        @st.fragment(run_every=f"{speed_seconds}s")
+        @st.fragment(run_every=f"{speed_seconds}s" if st.session_state.factory_running else None)
         def factory_replay_panel():
             if st.session_state.factory_running:
                 if st.session_state.factory_skip_first_tick:
@@ -2263,6 +2215,7 @@ elif page == "Live Monitoring":
                                 engineer_decision,
                                 engineer_note.strip()
                             ))
+                        load_engineer_decisions.clear()
                         st.success("Engineer decision saved to the SQLite database.")
                     except sqlite3.Error as exc:
                         st.error(f"Could not save the engineer decision: {exc}")
@@ -2277,8 +2230,10 @@ elif page == "Live Monitoring":
                 width="stretch", hide_index=True
             )
             try:
-                with sqlite3.connect(DATABASE_PATH) as review_db:
-                    review_table = pd.read_sql_query("""
+                @st.cache_data(ttl=60, show_spinner=False)
+                def load_engineer_decisions():
+                    with sqlite3.connect(DATABASE_PATH) as review_db:
+                        return pd.read_sql_query("""
                         SELECT review_id AS "Review ID",
                                reviewed_at_utc AS "Reviewed At (UTC)",
                                replay_step AS "Replay Step",
@@ -2289,7 +2244,8 @@ elif page == "Live Monitoring":
                                reason AS "Reason"
                         FROM engineer_decisions
                         ORDER BY review_id DESC
-                    """, review_db)
+                        """, review_db)
+                review_table = load_engineer_decisions()
                 if not review_table.empty:
                     st.subheader("Engineer Decision Log (Saved in SQLite)")
                     st.dataframe(review_table, width="stretch", hide_index=True)
