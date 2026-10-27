@@ -3,10 +3,13 @@ import pandas as pd
 import sqlite3
 from pathlib import Path
 import base64
+from datetime import datetime, timezone
+
+APP_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = APP_DIR / "predictive_maintenance.db"
 
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-
+from lightgbm import LGBMClassifier
 
 # ==================================================
 # 1. PAGE CONFIGURATION
@@ -18,8 +21,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-
 
 # ==================================================
 # VISUAL DESIGN — PreM-DSS
@@ -268,7 +269,7 @@ st.markdown(
             font-size: 1.65rem;
         }
     }
-    
+
     /* ---------- Professional sidebar navigation ---------- */
     [data-testid="stSidebar"] [role="radiogroup"] {
         gap: 0.18rem;
@@ -520,9 +521,7 @@ def page_header(title, subtitle, eyebrow="PreM-DSS"):
 # 2. LOAD DATA FROM SQLITE DATABASE
 # ==================================================
 
-connection = sqlite3.connect(
-    "predictive_maintenance.db"
-)
+connection = sqlite3.connect(DATABASE_PATH)
 
 query = """
 SELECT *
@@ -535,7 +534,6 @@ df = pd.read_sql_query(
 )
 
 connection.close()
-
 
 # ==================================================
 # 3. TRAIN PREDICTION MODEL FOR APPLICATION
@@ -554,14 +552,12 @@ X = df[feature_columns].copy()
 
 y = df["Machine failure"]
 
-
 # One-hot encode product type
 X_encoded = pd.get_dummies(
     X,
     columns=["Type"],
     dtype=int
 )
-
 
 # Rename columns to safe feature names
 X_encoded = X_encoded.rename(
@@ -574,7 +570,6 @@ X_encoded = X_encoded.rename(
     }
 )
 
-
 # Same 90/10 split used in our experiments
 X_train, X_test, y_train, y_test = train_test_split(
     X_encoded,
@@ -584,22 +579,125 @@ X_train, X_test, y_train, y_test = train_test_split(
     stratify=y
 )
 
-
-# Create Random Forest model
-model = RandomForestClassifier(
+# Create LightGBM model
+model = LGBMClassifier(
     n_estimators=200,
+    learning_rate=0.05,
+    max_depth=-1,
     random_state=42,
     class_weight="balanced",
+    verbosity=-1,
     n_jobs=-1
 )
-
 
 # Train model
 model.fit(
     X_train,
     y_train
 )
+# ==========================================
+# LIGHTGBM MODEL VALIDATION
+# ==========================================
 
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix
+)
+
+# Predict failure probabilities on unseen test data
+y_prob = model.predict_proba(X_test)[:, 1]
+
+# Evaluate the standard 50% threshold
+y_pred_50 = (y_prob >= 0.50).astype(int)
+
+print("\n===== LIGHTGBM MODEL VALIDATION =====")
+
+print("Accuracy:", accuracy_score(y_test, y_pred_50))
+print("Precision:", precision_score(y_test, y_pred_50, zero_division=0))
+print("Recall:", recall_score(y_test, y_pred_50, zero_division=0))
+print("F1-score:", f1_score(y_test, y_pred_50, zero_division=0))
+
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred_50))
+
+# Evaluate our existing 40% maintenance-alert threshold
+y_pred_40 = (y_prob >= 0.40).astype(int)
+
+print("\n===== LIGHTGBM AT 40% ALERT THRESHOLD =====")
+print("Precision:", precision_score(y_test, y_pred_40, zero_division=0))
+print("Recall:", recall_score(y_test, y_pred_40, zero_division=0))
+print("F1-score:", f1_score(y_test, y_pred_40, zero_division=0))
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred_40))
+
+# ==========================================
+# LIGHTGBM THRESHOLD COMPARISON
+# ==========================================
+
+print("\n===== LIGHTGBM THRESHOLD COMPARISON =====")
+
+for threshold in [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]:
+    predictions = (y_prob >= threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(
+        y_test, predictions
+    ).ravel()
+
+    precision = precision_score(
+        y_test, predictions, zero_division=0
+    )
+
+    recall = recall_score(
+        y_test, predictions, zero_division=0
+    )
+
+    f1 = f1_score(
+        y_test, predictions, zero_division=0
+    )
+
+    print(
+        f"Threshold: {threshold:.0%} | "
+        f"Detected: {tp} | "
+        f"Missed: {fn} | "
+        f"False Alarms: {fp} | "
+        f"Precision: {precision:.2%} | "
+        f"Recall: {recall:.2%} | "
+        f"F1: {f1:.2%}"
+    )
+# Shared prototype alert policy and dynamically computed evaluation.
+# The 60% setting is exploratory; a separate validation set is needed
+# before treating the threshold choice as independently validated.
+ALERT_THRESHOLD = 0.60
+
+
+def risk_category(probability_percent):
+    if probability_percent < 20:
+        return "LOW"
+    if probability_percent < 40:
+        return "MODERATE"
+    if probability_percent < 70:
+        return "HIGH"
+    return "CRITICAL"
+
+
+def evaluation_at(threshold):
+    predicted = (y_prob >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_test, predicted).ravel()
+    return {"threshold": threshold, "tn": int(tn), "fp": int(fp),
+            "fn": int(fn), "tp": int(tp),
+            "accuracy": accuracy_score(y_test, predicted),
+            "precision": precision_score(y_test, predicted, zero_division=0),
+            "recall": recall_score(y_test, predicted, zero_division=0),
+            "f1": f1_score(y_test, predicted, zero_division=0)}
+
+
+alert_evaluation = evaluation_at(ALERT_THRESHOLD)
+standard_evaluation = evaluation_at(0.50)
+threshold_evaluations = [evaluation_at(t) for t in
+                         [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]]
 
 # ==================================================
 # 4. SIDEBAR NAVIGATION
@@ -618,14 +716,14 @@ st.sidebar.markdown(
 )
 
 menu_options = {
-    "⌂   Dashboard": "Dashboard",
-    "⌁   AI Failure Prediction": "AI Failure Prediction",
-    "△   Risk Monitor": "Risk Monitor",
-    "⌁   Live Monitoring": "Live Monitoring",
-    "▥   Risk Factor Analysis": "Risk Factor Analysis",
-    "✓   Validation & Limitations": "Validation & Limitations",
-    "◔   Model Performance": "Model Performance",
-    "▤   Machine Data": "Machine Data"
+    "Dashboard": "Dashboard",
+    "AI Failure Prediction": "AI Failure Prediction",
+    "Risk Monitor": "Risk Monitor",
+    "Live Monitoring": "Live Monitoring",
+    "Risk Factor Analysis": "Risk Factor Analysis",
+    "Validation & Limitations": "Validation & Limitations",
+    "Model Performance": "Model Performance",
+    "Machine Data": "Machine Data"
 }
 
 selected_menu = st.sidebar.radio(
@@ -638,7 +736,6 @@ page = menu_options[selected_menu]
 
 st.sidebar.divider()
 st.sidebar.caption("AI4I Predictive Maintenance Project")
-
 
 # ==================================================
 # PAGE 1 — DASHBOARD
@@ -675,7 +772,6 @@ if page == "Dashboard":
         unsafe_allow_html=True
     )
 
-
     # ----------------------------------------------
     # SYSTEM OVERVIEW
     # ----------------------------------------------
@@ -687,13 +783,12 @@ if page == "Dashboard":
     )
 
     normal_operations = (
-        total_records - total_failures
+            total_records - total_failures
     )
 
     failure_rate = (
-        total_failures / total_records
-    ) * 100
-
+                           total_failures / total_records
+                   ) * 100
 
     st.subheader("System Overview")
 
@@ -739,7 +834,6 @@ if page == "Dashboard":
             unsafe_allow_html=True
         )
 
-
     # ----------------------------------------------
     # FAILURE ANALYSIS
     # ----------------------------------------------
@@ -749,7 +843,6 @@ if page == "Dashboard":
     st.subheader("Failure Analysis")
 
     chart_col1, chart_col2 = st.columns(2)
-
 
     with chart_col1:
 
@@ -771,7 +864,6 @@ if page == "Dashboard":
         st.bar_chart(
             failure_distribution
         )
-
 
     with chart_col2:
 
@@ -807,7 +899,6 @@ if page == "Dashboard":
             failure_modes
         )
 
-
     # ----------------------------------------------
     # OPERATIONAL RISK ANALYSIS
     # ----------------------------------------------
@@ -819,7 +910,6 @@ if page == "Dashboard":
     )
 
     analysis_col1, analysis_col2 = st.columns(2)
-
 
     with analysis_col1:
 
@@ -846,9 +936,9 @@ if page == "Dashboard":
         product_analysis[
             "Failure Rate (%)"
         ] = (
-            product_analysis["Failures"]
-            / product_analysis["Total_Records"]
-            * 100
+                product_analysis["Failures"]
+                / product_analysis["Total_Records"]
+                * 100
         )
 
         product_analysis = (
@@ -870,25 +960,23 @@ if page == "Dashboard":
             hide_index=True
         )
 
-
     with analysis_col2:
 
         st.write(
             "#### Average Conditions: Normal vs Failure"
         )
 
+        condition_columns = [
+            "Air temperature [K]",
+            "Process temperature [K]",
+            "Rotational speed [rpm]",
+            "Torque [Nm]",
+            "Tool wear [min]"
+        ]
+
         condition_analysis = (
-            df.groupby(
-                "Machine failure"
-            )[
-                [
-                    "Air temperature [K]",
-                    "Process temperature [K]",
-                    "Rotational speed [rpm]",
-                    "Torque [Nm]",
-                    "Tool wear [min]"
-                ]
-            ]
+            df[["Machine failure"] + condition_columns]
+            .groupby("Machine failure")
             .mean()
             .round(2)
             .reset_index()
@@ -914,7 +1002,6 @@ if page == "Dashboard":
             hide_index=True
         )
 
-
     # ----------------------------------------------
     # KEY OBSERVATIONS
     # ----------------------------------------------
@@ -926,7 +1013,6 @@ if page == "Dashboard":
     insight_col1, insight_col2, insight_col3 = (
         st.columns(3)
     )
-
 
     with insight_col1:
 
@@ -940,7 +1026,6 @@ if page == "Dashboard":
             """
         )
 
-
     with insight_col2:
 
         st.info(
@@ -953,7 +1038,6 @@ if page == "Dashboard":
             **39.63 Nm** during normal operation.
             """
         )
-
 
     with insight_col3:
 
@@ -983,13 +1067,11 @@ elif page == "AI Failure Prediction":
 
     st.divider()
 
-
     st.subheader(
         "Machine Operating Conditions"
     )
 
     input_col1, input_col2 = st.columns(2)
-
 
     with input_col1:
 
@@ -1013,7 +1095,6 @@ elif page == "AI Failure Prediction":
             value=310.0,
             step=0.1
         )
-
 
     with input_col2:
 
@@ -1041,13 +1122,11 @@ elif page == "AI Failure Prediction":
             step=1
         )
 
-
     st.divider()
 
-
     if st.button(
-        "Analyze Machine",
-        type="primary"
+            "Analyze Machine",
+            type="primary"
     ):
 
         input_data = pd.DataFrame(
@@ -1086,11 +1165,9 @@ elif page == "AI Failure Prediction":
             }
         )
 
-
         input_data = input_data[
             X_train.columns
         ]
-
 
         failure_probability = (
             model.predict_proba(
@@ -1099,9 +1176,8 @@ elif page == "AI Failure Prediction":
         )
 
         probability_percent = (
-            failure_probability * 100
+                failure_probability * 100
         )
-
 
         if probability_percent < 20:
 
@@ -1119,7 +1195,6 @@ elif page == "AI Failure Prediction":
 
             risk_level = "CRITICAL"
 
-
         st.subheader(
             "Prediction Result"
         )
@@ -1128,14 +1203,12 @@ elif page == "AI Failure Prediction":
             st.columns(2)
         )
 
-
         with result_col1:
 
             st.metric(
                 "Failure Probability",
                 f"{probability_percent:.2f}%"
             )
-
 
         with result_col2:
 
@@ -1144,20 +1217,18 @@ elif page == "AI Failure Prediction":
                 risk_level
             )
 
-
         st.subheader(
             "Maintenance Decision"
         )
 
-
-        if failure_probability >= 0.40:
+        if failure_probability >= ALERT_THRESHOLD:
 
             maintenance_alert = "YES"
 
             st.error(
                 "MAINTENANCE ALERT — The predicted failure "
                 "probability has reached or exceeded the "
-                "prototype maintenance-alert threshold of 40%. "
+                "provisional maintenance-alert threshold of 60%. "
                 "Inspection and maintenance assessment are "
                 "recommended."
             )
@@ -1170,7 +1241,7 @@ elif page == "AI Failure Prediction":
 
                 st.warning(
                     "ELEVATED RISK — The machine has not "
-                    "reached the 40% maintenance-alert threshold, "
+                    "reached the 60% maintenance-alert threshold, "
                     "but closer monitoring is recommended."
                 )
 
@@ -1183,20 +1254,164 @@ elif page == "AI Failure Prediction":
                     "maintenance."
                 )
 
-
         st.metric(
             "Maintenance Alert",
             maintenance_alert
         )
 
-
         st.caption(
-            "Prototype maintenance-alert threshold: 40%. "
-            "This threshold was selected from the Random Forest "
-            "threshold analysis because it achieved the highest "
-            "F1-score among the tested thresholds while improving "
-            "failure recall."
+            f"Provisional maintenance-alert threshold: {ALERT_THRESHOLD:.0%}. "
+            f"In an exploratory test-set comparison, it detected "
+            f"{alert_evaluation['tp']} of {alert_evaluation['tp'] + alert_evaluation['fn']} "
+            f"failures with {alert_evaluation['fp']} false alarms. "
+            "Threshold selection requires separate validation before deployment."
         )
+
+        # ------------------------------------------
+        # INDIVIDUAL LIGHTGBM PREDICTION EXPLANATION
+        # ------------------------------------------
+
+        st.divider()
+        st.subheader("How LightGBM Reached This Prediction")
+
+        st.write(
+            "This explanation shows how each machine operating input "
+            "influenced the model's predicted failure risk. "
+            "It explains the AI prediction, not the physical cause of failure."
+        )
+
+        try:
+            # Calculate SHAP-style contributions using LightGBM.
+            contributions = model.booster_.predict(
+                input_data,
+                pred_contrib=True
+            )
+
+            contribution_row = contributions[0]
+
+            feature_effects = pd.Series(
+                contribution_row[:-1],
+                index=X_train.columns,
+                dtype=float
+            )
+
+            baseline_score = float(contribution_row[-1])
+
+            # Combine the three product-type encoded features.
+            readable_effects = pd.Series({
+                "Product Type": feature_effects[
+                    ["Type_H", "Type_L", "Type_M"]
+                ].sum(),
+
+                "Air Temperature": feature_effects[
+                    "Air_temperature"
+                ],
+
+                "Process Temperature": feature_effects[
+                    "Process_temperature"
+                ],
+
+                "Rotational Speed": feature_effects[
+                    "Rotational_speed"
+                ],
+
+                "Torque": feature_effects[
+                    "Torque"
+                ],
+
+                "Tool Wear": feature_effects[
+                    "Tool_wear"
+                ]
+            })
+
+            explanation_table = pd.DataFrame({
+                "Operating Input": readable_effects.index,
+                "Contribution (log-odds)": readable_effects.values
+            })
+
+            explanation_table["Effect on Predicted Risk"] = (
+                explanation_table["Contribution (log-odds)"].apply(
+                    lambda value:
+                    "Increases" if value > 0.000001
+                    else "Decreases" if value < -0.000001
+                    else "Minimal"
+                )
+            )
+
+            explanation_table["Absolute Impact"] = (
+                explanation_table["Contribution (log-odds)"].abs()
+            )
+
+            explanation_table = explanation_table.sort_values(
+                "Absolute Impact",
+                ascending=False
+            )
+
+            st.write("#### Which Inputs Influenced the Prediction?")
+
+            st.bar_chart(
+                explanation_table.set_index("Operating Input")[
+                    ["Contribution (log-odds)"]
+                ]
+            )
+
+            st.dataframe(
+                explanation_table.drop(
+                    columns="Absolute Impact"
+                ).round(4),
+                width="stretch",
+                hide_index=True
+            )
+
+            leading_input = explanation_table.iloc[0]
+
+            st.info(
+                f"**Largest model influence:** "
+                f"{leading_input['Operating Input']} "
+                f"({leading_input['Effect on Predicted Risk'].lower()} "
+                "the predicted risk relative to the model baseline)."
+            )
+
+            with st.expander("How to Interpret This Explanation"):
+
+                st.write(
+                    "LightGBM starts with a baseline model score "
+                    "and adds the contribution of each input. "
+                    "Positive contributions increase predicted failure "
+                    "risk, while negative contributions decrease it."
+                )
+
+                st.write(
+                    "The contribution values are measured in "
+                    "**log-odds**, not percentages. "
+                    "They describe how the trained model behaves."
+                )
+
+                st.write(
+                    f"Baseline score: {baseline_score:.4f}"
+                )
+
+                st.write(
+                    f"Sum of contributions: "
+                    f"{readable_effects.sum():+.4f}"
+                )
+
+                st.write(
+                    f"Final raw model score: "
+                    f"{baseline_score + readable_effects.sum():.4f}"
+                )
+
+                st.caption(
+                    "These explanations do not prove causation. "
+                    "A high predicted failure probability does not "
+                    "guarantee that a machine will fail."
+                )
+
+        except (AttributeError, ValueError, TypeError, KeyError, IndexError) as exc:
+            st.warning(
+                "The prediction was calculated, but its individual "
+                f"feature contributions could not be displayed: {exc}"
+            )
 
         # ------------------------------------------
         # HISTORICAL RISK INDICATORS
@@ -1218,7 +1433,6 @@ elif page == "AI Failure Prediction":
 
         # High tool wear
         if tool_wear > 200:
-
             risk_indicators.append(
                 "🔧 **High Tool Wear:** Tool wear is above "
                 "200 minutes. Historical records in the 201+ "
@@ -1261,7 +1475,6 @@ elif page == "AI Failure Prediction":
 
         # Product type
         if product_type == "L":
-
             risk_indicators.append(
                 "🏷️ **Product Type L:** Type L had the highest "
                 "historical failure rate among the three product "
@@ -1271,7 +1484,6 @@ elif page == "AI Failure Prediction":
         if risk_indicators:
 
             for indicator in risk_indicators:
-
                 st.warning(
                     indicator
                 )
@@ -1337,7 +1549,6 @@ elif page == "Risk Monitor":
 
     st.divider()
 
-
     monitor_features = df[
         [
             "Type",
@@ -1349,13 +1560,11 @@ elif page == "Risk Monitor":
         ]
     ].copy()
 
-
     monitor_encoded = pd.get_dummies(
         monitor_features,
         columns=["Type"],
         dtype=int
     )
-
 
     monitor_encoded = monitor_encoded.rename(
         columns={
@@ -1367,18 +1576,15 @@ elif page == "Risk Monitor":
         }
     )
 
-
     monitor_encoded = monitor_encoded[
         X_train.columns
     ]
-
 
     monitor_probabilities = (
         model.predict_proba(
             monitor_encoded
         )[:, 1]
     )
-
 
     risk_df = df[
         [
@@ -1393,27 +1599,16 @@ elif page == "Risk Monitor":
         ]
     ].copy()
 
-
     risk_df[
         "Failure Probability (%)"
     ] = (
-        monitor_probabilities * 100
+            monitor_probabilities * 100
     ).round(2)
 
 
     def assign_risk_level(probability):
 
-        if probability < 20:
-            return "LOW"
-
-        elif probability < 40:
-            return "MODERATE"
-
-        elif probability < 70:
-            return "HIGH"
-
-        else:
-            return "CRITICAL"
+        return risk_category(probability)
 
 
     risk_df[
@@ -1424,7 +1619,6 @@ elif page == "Risk Monitor":
         assign_risk_level
     )
 
-
     risk_df[
         "Maintenance Alert"
     ] = risk_df[
@@ -1432,43 +1626,39 @@ elif page == "Risk Monitor":
     ].apply(
         lambda probability:
         "YES"
-        if probability >= 40
+        if probability >= ALERT_THRESHOLD * 100
         else "NO"
     )
-
 
     total_monitored = len(
         risk_df
     )
 
     maintenance_alerts = (
-        risk_df[
-            "Maintenance Alert"
-        ] == "YES"
+            risk_df[
+                "Maintenance Alert"
+            ] == "YES"
     ).sum()
 
     critical_records = (
-        risk_df[
-            "Risk Level"
-        ] == "CRITICAL"
+            risk_df[
+                "Risk Level"
+            ] == "CRITICAL"
     ).sum()
 
     high_risk_records = (
-        risk_df[
-            "Risk Level"
-        ] == "HIGH"
+            risk_df[
+                "Risk Level"
+            ] == "HIGH"
     ).sum()
-
 
     st.subheader(
         "Risk Overview"
     )
 
-
     metric1, metric2, metric3, metric4 = (
         st.columns(4)
     )
-
 
     with metric1:
 
@@ -1477,14 +1667,12 @@ elif page == "Risk Monitor":
             f"{total_monitored:,}"
         )
 
-
     with metric2:
 
         st.metric(
             "Maintenance Alerts",
             f"{maintenance_alerts:,}"
         )
-
 
     with metric3:
 
@@ -1493,7 +1681,6 @@ elif page == "Risk Monitor":
             f"{high_risk_records:,}"
         )
 
-
     with metric4:
 
         st.metric(
@@ -1501,13 +1688,11 @@ elif page == "Risk Monitor":
             f"{critical_records:,}"
         )
 
-
     st.divider()
 
     st.subheader(
         "Risk Distribution"
     )
-
 
     risk_order = [
         "LOW",
@@ -1515,7 +1700,6 @@ elif page == "Risk Monitor":
         "HIGH",
         "CRITICAL"
     ]
-
 
     risk_distribution = (
         risk_df[
@@ -1528,11 +1712,9 @@ elif page == "Risk Monitor":
         )
     )
 
-
     st.bar_chart(
         risk_distribution
     )
-
 
     st.divider()
 
@@ -1565,8 +1747,8 @@ elif page == "Risk Monitor":
             **{high_risk_records:,} records** have a predicted
             failure probability between **40% and 69.99%**.
 
-            These records have crossed the prototype maintenance
-            alert threshold and should be reviewed.
+            These records warrant closer monitoring; those at or above
+            the 60% alert threshold generate a maintenance alert.
             """
         )
 
@@ -1582,7 +1764,6 @@ elif page == "Risk Monitor":
         "Machine Risk Records"
     )
 
-
     selected_risk = st.selectbox(
         "Filter by Risk Level",
         [
@@ -1594,7 +1775,6 @@ elif page == "Risk Monitor":
             "LOW"
         ]
     )
-
 
     if selected_risk == "All":
 
@@ -1608,7 +1788,7 @@ elif page == "Risk Monitor":
             risk_df[
                 "Maintenance Alert"
             ] == "YES"
-        ].copy()
+            ].copy()
 
     else:
 
@@ -1616,8 +1796,7 @@ elif page == "Risk Monitor":
             risk_df[
                 "Risk Level"
             ] == selected_risk
-        ].copy()
-
+            ].copy()
 
     filtered_risk_df = (
         filtered_risk_df.sort_values(
@@ -1626,11 +1805,9 @@ elif page == "Risk Monitor":
         )
     )
 
-
     st.write(
         f"Showing **{len(filtered_risk_df):,}** records."
     )
-
 
     st.dataframe(
         filtered_risk_df,
@@ -1638,13 +1815,12 @@ elif page == "Risk Monitor":
         hide_index=True
     )
 
-
     st.info(
         """
         **Decision Support**
 
         Records with a predicted failure probability of
-        **40% or higher** generate a prototype maintenance alert.
+        **60% or higher** generate a prototype maintenance alert.
 
         Higher-risk records are displayed first so that
         maintenance personnel can prioritize inspection and
@@ -1655,7 +1831,6 @@ elif page == "Risk Monitor":
         not as a validated industrial maintenance standard.
         """
     )
-
 
     # ----------------------------------------------
     # INDIVIDUAL MACHINE INSPECTION
@@ -1673,12 +1848,10 @@ elif page == "Risk Monitor":
         "maintenance action."
     )
 
-
     inspection_options = risk_df.sort_values(
         "Failure Probability (%)",
         ascending=False
     ).copy()
-
 
     inspection_options[
         "Selection Label"
@@ -1691,7 +1864,6 @@ elif page == "Risk Monitor":
         axis=1
     )
 
-
     selected_machine = st.selectbox(
         "Select Machine Record",
         inspection_options[
@@ -1699,12 +1871,11 @@ elif page == "Risk Monitor":
         ].tolist()
     )
 
-
     selected_row = inspection_options[
         inspection_options[
             "Selection Label"
         ] == selected_machine
-    ].iloc[0]
+        ].iloc[0]
     selected_failure_probability = float(
         selected_row["Failure Probability (%)"]
     )
@@ -1725,13 +1896,11 @@ elif page == "Risk Monitor":
         selected_row["Tool wear [min]"]
     )
 
-
     st.write(
         "#### Machine Identification"
     )
 
     id_col1, id_col2, id_col3 = st.columns(3)
-
 
     with id_col1:
 
@@ -1740,14 +1909,12 @@ elif page == "Risk Monitor":
             int(selected_row["UDI"])
         )
 
-
     with id_col2:
 
         st.metric(
             "Product ID",
             selected_row["Product ID"]
         )
-
 
     with id_col3:
 
@@ -1756,13 +1923,11 @@ elif page == "Risk Monitor":
             selected_row["Type"]
         )
 
-
     st.write(
         "#### AI Risk Assessment"
     )
 
     risk_col1, risk_col2, risk_col3 = st.columns(3)
-
 
     with risk_col1:
 
@@ -1771,14 +1936,12 @@ elif page == "Risk Monitor":
             f"{selected_failure_probability:.2f}%"
         )
 
-
     with risk_col2:
 
         st.metric(
             "Risk Level",
             selected_row["Risk Level"]
         )
-
 
     with risk_col3:
 
@@ -1787,12 +1950,9 @@ elif page == "Risk Monitor":
             selected_row["Maintenance Alert"]
         )
 
-
-
     st.write(
         "#### Operating Conditions"
     )
-
 
     machine_conditions = pd.DataFrame(
         {
@@ -1814,21 +1974,17 @@ elif page == "Risk Monitor":
         }
     )
 
-
     st.dataframe(
         machine_conditions,
         width="stretch",
         hide_index=True
     )
 
-
     st.write(
         "#### Recommended Action"
     )
 
-
     selected_probability = selected_failure_probability
-
 
     if selected_probability >= 70:
 
@@ -1839,12 +1995,19 @@ elif page == "Risk Monitor":
         )
 
 
+    elif selected_probability >= 60:
+
+        st.warning(
+            "MAINTENANCE ALERT — This record has crossed the "
+            "60% provisional maintenance-alert threshold. "
+            "Inspection and closer monitoring are recommended."
+        )
+
     elif selected_probability >= 40:
 
         st.warning(
-            "HIGH PRIORITY — This record has crossed the "
-            "40% prototype maintenance-alert threshold. "
-            "Inspection and closer monitoring are recommended."
+            "HIGH RISK — Below the 60% maintenance-alert threshold. "
+            "Closer monitoring is recommended."
         )
 
 
@@ -1865,12 +2028,13 @@ elif page == "Risk Monitor":
             "routine monitoring and scheduled maintenance."
         )
 
-
     st.caption(
-        "The recommendation is generated from the Random Forest "
-        "failure probability and prototype decision thresholds. "
-        "It should support, not replace, engineering inspection "
-        "and maintenance judgment."
+        "The maintenance recommendation is based on the LightGBM "
+        "predicted failure probability and the application's "
+        "prototype decision rules, including a provisional 60% "
+        "maintenance-alert threshold. The recommendation is intended "
+        "to support, not replace, engineering inspection and "
+        "maintenance judgment."
     )
 
 
@@ -1879,72 +2043,274 @@ elif page == "Risk Monitor":
 # ==================================================
 
 elif page == "Live Monitoring":
-
     page_header(
-        "Live Monitoring",
-        "Follow the simulated incoming machine-data stream, AI failure probabilities, risk levels, and maintenance alerts.",
-        "Simulated Real-Time Monitoring"
+        "Simulated Factory Control Room",
+        "Automatic historical observation replay with LightGBM risk predictions and engineer review.",
+        "Factory Simulation"
     )
-    st.info("**Historical stream replay:** AI4I observations are replayed sequentially to demonstrate a real-time monitoring architecture. This is not a connection to live industrial IoT sensors.")
-    st.divider()
+    st.info(
+        "SIMULATION ONLY — These are historical machine observations, not live factory "
+        "sensors or verified time-series measurements of one machine. Each replay step "
+        "represents a different observation, and the time axis is simulation step number."
+    )
 
+    # Prefer the existing historical monitoring records; fall back to the AI4I table
+    # if the monitoring table is missing. Neither source is live sensor telemetry.
     try:
-        realtime_connection = sqlite3.connect("predictive_maintenance.db")
-        realtime_df = pd.read_sql_query("SELECT * FROM realtime_monitoring ORDER BY id ASC", realtime_connection)
-        realtime_connection.close()
+        with sqlite3.connect(DATABASE_PATH) as replay_connection:
+            replay_df = pd.read_sql_query(
+                "SELECT * FROM realtime_monitoring ORDER BY id ASC", replay_connection
+            )
     except (sqlite3.Error, pd.errors.DatabaseError):
-        realtime_df = pd.DataFrame()
+        replay_df = pd.DataFrame()
 
-    if realtime_df.empty:
-        st.warning("No monitoring records are available. Run 17_realtime_database.py first.")
+    required_replay_columns = [
+        "product_type", "air_temperature", "process_temperature",
+        "rotational_speed", "torque", "tool_wear"
+    ]
+    if replay_df.empty or not all(c in replay_df.columns for c in required_replay_columns):
+        replay_df = df[[
+            "UDI", "Product ID", "Type", "Air temperature [K]",
+            "Process temperature [K]", "Rotational speed [rpm]",
+            "Torque [Nm]", "Tool wear [min]"
+        ]].rename(columns={
+            "UDI": "id", "Product ID": "product_id", "Type": "product_type",
+            "Air temperature [K]": "air_temperature",
+            "Process temperature [K]": "process_temperature",
+            "Rotational speed [rpm]": "rotational_speed",
+            "Torque [Nm]": "torque", "Tool wear [min]": "tool_wear"
+        }).copy()
+        st.caption("Replay source: AI4I machine_data table (historical observations).")
     else:
-        total_stream_records = len(realtime_df)
-        total_stream_alerts = int((realtime_df["maintenance_alert"] == "YES").sum())
-        critical_stream_records = int((realtime_df["risk_level"] == "CRITICAL").sum())
-        moderate_stream_records = int((realtime_df["risk_level"] == "MODERATE").sum())
+        st.caption("Replay source: realtime_monitoring SQLite table (stored historical observations).")
 
-        st.subheader("Monitoring Overview")
-        a,b,c1,d = st.columns(4)
-        a.metric("Records Processed", f"{total_stream_records:,}")
-        b.metric("Maintenance Alerts", f"{total_stream_alerts:,}")
-        c1.metric("Critical Risk", f"{critical_stream_records:,}")
-        d.metric("Moderate Risk", f"{moderate_stream_records:,}")
+    replay_df = replay_df.dropna(subset=required_replay_columns).reset_index(drop=True)
+    if replay_df.empty:
+        st.error("No complete historical observations are available for simulation.")
+    else:
+        # Match exactly the feature names and ordering used during model training.
+        replay_features = pd.DataFrame({
+            "Air_temperature": replay_df["air_temperature"].astype(float),
+            "Process_temperature": replay_df["process_temperature"].astype(float),
+            "Rotational_speed": replay_df["rotational_speed"].astype(float),
+            "Torque": replay_df["torque"].astype(float),
+            "Tool_wear": replay_df["tool_wear"].astype(float),
+            "Type_H": (replay_df["product_type"] == "H").astype(int),
+            "Type_L": (replay_df["product_type"] == "L").astype(int),
+            "Type_M": (replay_df["product_type"] == "M").astype(int),
+        })[X_train.columns]
+        replay_probabilities = model.predict_proba(replay_features)[:, 1]
+        replay_df["failure_probability"] = replay_probabilities * 100
+        replay_df["risk_level"] = [risk_category(p) for p in replay_df["failure_probability"]]
+        replay_df["maintenance_alert"] = [
+            "YES" if p >= ALERT_THRESHOLD else "NO" for p in replay_probabilities
+        ]
 
-        st.divider(); st.subheader("Latest Machine Reading")
-        latest = realtime_df.iloc[-1]
-        a,b,c1 = st.columns(3)
-        a.metric("UDI", int(latest["udi"])); b.metric("Product ID", latest["product_id"]); c1.metric("Product Type", latest["product_type"])
-        a,b,c1 = st.columns(3)
-        a.metric("Failure Probability", f"{float(latest['failure_probability']):.2f}%"); b.metric("Risk Level", latest["risk_level"]); c1.metric("Maintenance Alert", latest["maintenance_alert"])
-        conditions=pd.DataFrame({"Parameter":["Timestamp","Air Temperature","Process Temperature","Rotational Speed","Torque","Tool Wear"],"Value":[latest["timestamp"],f"{float(latest['air_temperature']):.1f} K",f"{float(latest['process_temperature']):.1f} K",f"{int(latest['rotational_speed'])} rpm",f"{float(latest['torque']):.1f} Nm",f"{int(latest['tool_wear'])} min"]})
-        st.dataframe(conditions,width="stretch",hide_index=True)
-        if latest["maintenance_alert"] == "YES": st.error("MAINTENANCE ALERT — The latest record crossed the 40% prototype threshold. Inspection and maintenance assessment are recommended.")
-        elif latest["risk_level"] == "MODERATE": st.warning("MODERATE RISK — Below the alert threshold, but closer monitoring is recommended.")
-        else: st.success("LOW RISK — Below the prototype maintenance-alert threshold. Continue monitoring.")
+        # All state belongs to the current Streamlit browser session.
+        if "factory_step" not in st.session_state:
+            st.session_state.factory_step = 0
+        if "factory_running" not in st.session_state:
+            st.session_state.factory_running = False
+        # Create a separate review table; never modify historical machine records.
+        with sqlite3.connect(DATABASE_PATH) as review_db:
+            review_db.execute("""
+                CREATE TABLE IF NOT EXISTS engineer_decisions (
+                    review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reviewed_at_utc TEXT NOT NULL,
+                    replay_step INTEGER NOT NULL,
+                    product_id TEXT NOT NULL,
+                    failure_probability_percent REAL NOT NULL,
+                    maintenance_alert TEXT NOT NULL,
+                    engineer_decision TEXT NOT NULL,
+                    reason TEXT NOT NULL
+                )
+            """)
+        st.session_state.factory_step = min(
+            st.session_state.factory_step, len(replay_df) - 1
+        )
 
-        st.divider(); st.subheader("Failure Risk Across Incoming Readings")
-        chart=realtime_df[["id","failure_probability"]].rename(columns={"id":"Reading","failure_probability":"Failure Probability (%)"}).set_index("Reading")
-        st.line_chart(chart)
-        st.caption("AI-estimated failure probability for each stored stream observation. Prototype maintenance-alert threshold: 40%.")
+        st.subheader("Simulation Controls")
+        control1, control2, control3, control4 = st.columns([1, 1, 1, 2])
+        with control1:
+            if st.button("▶ Start", use_container_width=True, type="primary"):
+                if st.session_state.factory_step >= len(replay_df) - 1:
+                    st.session_state.factory_step = 0
+                st.session_state.factory_running = True
+                st.session_state.factory_skip_first_tick = True
+        with control2:
+            if st.button("⏸ Pause", use_container_width=True):
+                st.session_state.factory_running = False
+        with control3:
+            if st.button("↺ Restart", use_container_width=True):
+                st.session_state.factory_running = False
+                st.session_state.factory_step = 0
+                st.session_state.factory_skip_first_tick = False
+        with control4:
+            speed_seconds = st.selectbox(
+                "Seconds per observation", [2, 3, 5], index=1,
+                help="Automatic replay speed; one historical observation per interval."
+            )
 
-        st.divider(); st.subheader("Stream Risk Distribution")
-        dist=realtime_df["risk_level"].value_counts().reindex(["LOW","MODERATE","HIGH","CRITICAL"],fill_value=0)
-        st.bar_chart(dist)
+        # Prevent Start from skipping the first observation on its own rerun.
+        # Subsequent timed fragment reruns advance the replay.
+        if "factory_skip_first_tick" not in st.session_state:
+            st.session_state.factory_skip_first_tick = False
 
-        st.divider(); st.subheader("Maintenance Alerts")
-        alerts=realtime_df[realtime_df["maintenance_alert"]=="YES"].copy()
-        if alerts.empty: st.success("No maintenance alerts have been generated in the current monitoring history.")
-        else: st.dataframe(alerts[["timestamp","udi","product_id","product_type","failure_probability","risk_level","maintenance_alert","historical_failure"]].sort_values("failure_probability",ascending=False),width="stretch",hide_index=True)
 
-        st.divider(); st.subheader("Recent Monitoring History")
-        recent=realtime_df.sort_values("id",ascending=False).head(20)[["timestamp","udi","product_id","product_type","rotational_speed","torque","tool_wear","failure_probability","risk_level","maintenance_alert","historical_failure"]].copy()
-        recent=recent.rename(columns={"timestamp":"Timestamp","udi":"UDI","product_id":"Product ID","product_type":"Type","rotational_speed":"Speed [rpm]","torque":"Torque [Nm]","tool_wear":"Tool Wear [min]","failure_probability":"Failure Probability (%)","risk_level":"Risk Level","maintenance_alert":"Maintenance Alert","historical_failure":"Historical Failure"})
-        st.dataframe(recent,width="stretch",hide_index=True)
-        st.caption("Historical Failure is retained only for comparison with the original AI4I record; it is not an input to the prediction model.")
+        # Streamlit fragments rerun this part automatically without a button click.
+        # A stopped simulation still redraws but never advances its observation index.
+        @st.fragment(run_every=f"{speed_seconds}s")
+        def factory_replay_panel():
+            if st.session_state.factory_running:
+                if st.session_state.factory_skip_first_tick:
+                    st.session_state.factory_skip_first_tick = False
+                elif st.session_state.factory_step < len(replay_df) - 1:
+                    st.session_state.factory_step += 1
+                else:
+                    st.session_state.factory_running = False
 
-        st.divider(); st.subheader("Business Intelligence Interpretation")
-        st.write("Incoming observations are transformed into failure probabilities, risk levels, maintenance decisions, and persistent database records. In a real industrial implementation, the replay source could be replaced by machine sensors, an IoT platform, or another operational data source.")
-        st.warning("**Prototype limitation:** These are historical AI4I observations replayed as a simulated stream. Because replayed records may include training observations, this page demonstrates the monitoring architecture rather than independent predictive performance.")
+            position = st.session_state.factory_step
+            current = replay_df.iloc[position]
+            visible = replay_df.iloc[:position + 1].copy()
+            status = "RUNNING" if st.session_state.factory_running else "PAUSED"
+            st.write(
+                f"**Simulation status:** {status}  |  "
+                f"**Observation:** {position + 1:,} / {len(replay_df):,}  |  "
+                f"**Alert threshold:** {ALERT_THRESHOLD:.0%}"
+            )
+            st.progress((position + 1) / len(replay_df))
+
+            st.subheader("Current Machine Observation")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Product ID", str(current.get("product_id", current.get("id", "—"))))
+            m2.metric("Product Type", str(current["product_type"]))
+            m3.metric("Failure Probability", f"{current['failure_probability']:.2f}%")
+            m4.metric("Risk Level", str(current["risk_level"]))
+
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Air Temperature", f"{current['air_temperature']:.1f} K")
+            s2.metric("Process Temperature", f"{current['process_temperature']:.1f} K")
+            s3.metric("Rotational Speed", f"{current['rotational_speed']:.0f} rpm")
+            s4, s5 = st.columns(2)
+            s4.metric("Torque", f"{current['torque']:.1f} Nm")
+            s5.metric("Tool Wear", f"{current['tool_wear']:.0f} min")
+
+            if current["maintenance_alert"] == "YES":
+                st.error(
+                    "🚨 MAINTENANCE ALERT — LightGBM predicted failure probability "
+                    "has reached the provisional 60% threshold. Engineer review recommended."
+                )
+            elif current["failure_probability"] >= 20:
+                st.warning("Elevated predicted risk — continue monitoring and assess operating conditions.")
+            else:
+                st.success("No maintenance alert for this observation.")
+
+            st.subheader("Monitoring Charts (Replay Step, Not Actual Time)")
+            chart_history = visible.tail(100).copy()
+            chart_history.index = range(position + 2 - len(chart_history), position + 2)
+            chart_history.index.name = "Replay Step"
+            st.line_chart(chart_history[["failure_probability"]].rename(
+                columns={"failure_probability": "Failure Probability (%)"}
+            ))
+            left_chart, right_chart = st.columns(2)
+            with left_chart:
+                st.line_chart(chart_history[["air_temperature", "process_temperature"]].rename(
+                    columns={"air_temperature": "Air Temp (K)",
+                             "process_temperature": "Process Temp (K)"}
+                ))
+                st.line_chart(chart_history[["rotational_speed"]].rename(
+                    columns={"rotational_speed": "Rotational Speed (rpm)"}
+                ))
+            with right_chart:
+                st.line_chart(chart_history[["torque"]].rename(columns={"torque": "Torque (Nm)"}))
+                st.line_chart(chart_history[["tool_wear"]].rename(
+                    columns={"tool_wear": "Tool Wear (min)"}
+                ))
+
+            st.subheader("Maintenance Engineer Review")
+            st.caption(
+                "The AI recommends inspection; an engineer makes the final decision. "
+                "Pause the simulation before submitting a review."
+            )
+            with st.form("factory_engineer_review"):
+                engineer_decision = st.selectbox(
+                    "Engineer decision",
+                    ["Inspect machine", "Continue monitoring", "False alarm suspected",
+                     "Schedule maintenance"]
+                )
+                engineer_note = st.text_area("Reason / inspection note")
+                review_submitted = st.form_submit_button("Record Engineer Decision")
+            if review_submitted:
+                if st.session_state.factory_running:
+                    st.warning("Pause the simulation first, then submit your decision.")
+                elif not engineer_note.strip():
+                    st.warning("Enter a reason before recording the decision.")
+                else:
+                    try:
+                        with sqlite3.connect(DATABASE_PATH) as review_db:
+                            review_db.execute("""
+                                INSERT INTO engineer_decisions
+                                (reviewed_at_utc, replay_step, product_id,
+                                 failure_probability_percent, maintenance_alert,
+                                 engineer_decision, reason)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                position + 1,
+                                str(current.get("product_id", current.get("id", "—"))),
+                                round(float(current["failure_probability"]), 2),
+                                str(current["maintenance_alert"]),
+                                engineer_decision,
+                                engineer_note.strip()
+                            ))
+                        st.success("Engineer decision saved to the SQLite database.")
+                    except sqlite3.Error as exc:
+                        st.error(f"Could not save the engineer decision: {exc}")
+
+            st.subheader("Recent Replay History")
+            st.dataframe(
+                visible.tail(15).iloc[::-1][[
+                    "product_type", "air_temperature", "process_temperature",
+                    "rotational_speed", "torque", "tool_wear",
+                    "failure_probability", "risk_level", "maintenance_alert"
+                ]].round(2),
+                width="stretch", hide_index=True
+            )
+            try:
+                with sqlite3.connect(DATABASE_PATH) as review_db:
+                    review_table = pd.read_sql_query("""
+                        SELECT review_id AS "Review ID",
+                               reviewed_at_utc AS "Reviewed At (UTC)",
+                               replay_step AS "Replay Step",
+                               product_id AS "Product ID",
+                               failure_probability_percent AS "Failure Probability (%)",
+                               maintenance_alert AS "Maintenance Alert",
+                               engineer_decision AS "Engineer Decision",
+                               reason AS "Reason"
+                        FROM engineer_decisions
+                        ORDER BY review_id DESC
+                    """, review_db)
+                if not review_table.empty:
+                    st.subheader("Engineer Decision Log (Saved in SQLite)")
+                    st.dataframe(review_table, width="stretch", hide_index=True)
+                    st.download_button(
+                        "Download Engineer Decisions (CSV)",
+                        review_table.to_csv(index=False).encode("utf-8"),
+                        file_name="prem_dss_engineer_decisions.csv", mime="text/csv"
+                    )
+            except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+                st.error(f"Could not load engineer decision history: {exc}")
+            st.caption(
+                "LightGBM scores are computed from the stored observations and displayed "
+                "as the replay advances. "
+                "The 60% alert threshold is exploratory, not independently validated. "
+                "This replay is a demonstration, not real-time sensor monitoring or "
+                "independent evaluation of model performance. Engineer decisions "
+                "are saved in the local SQLite engineer_decisions table."
+            )
+
+
+        factory_replay_panel()
 
 
 # ==================================================
@@ -1971,27 +2337,25 @@ elif page == "Risk Factor Analysis":
 
     st.divider()
 
-
     # ----------------------------------------------
     # LOAD SAVED ANALYSIS RESULTS
     # ----------------------------------------------
 
     tool_wear_risk = pd.read_csv(
-        "tool_wear_risk_analysis.csv"
+        APP_DIR / "tool_wear_risk_analysis.csv"
     )
 
     torque_risk = pd.read_csv(
-        "torque_risk_analysis.csv"
+        APP_DIR / "torque_risk_analysis.csv"
     )
 
     speed_risk = pd.read_csv(
-        "speed_risk_analysis.csv"
+        APP_DIR / "speed_risk_analysis.csv"
     )
 
     product_risk = pd.read_csv(
-        "product_type_risk_analysis.csv"
+        APP_DIR / "product_type_risk_analysis.csv"
     )
-
 
     # ----------------------------------------------
     # KEY RISK INDICATORS
@@ -2002,7 +2366,6 @@ elif page == "Risk Factor Analysis":
     )
 
     indicator1, indicator2, indicator3 = st.columns(3)
-
 
     with indicator1:
 
@@ -2015,7 +2378,6 @@ elif page == "Risk Factor Analysis":
             )
         )
 
-
     with indicator2:
 
         st.metric(
@@ -2026,7 +2388,6 @@ elif page == "Risk Factor Analysis":
                 "with torque above 60 Nm."
             )
         )
-
 
     with indicator3:
 
@@ -2039,13 +2400,11 @@ elif page == "Risk Factor Analysis":
             )
         )
 
-
     st.caption(
         "These percentages are observed historical failure "
         "rates within the AI4I dataset, not predicted "
         "probabilities for an individual machine."
     )
-
 
     # ----------------------------------------------
     # TOOL WEAR ANALYSIS
@@ -2063,11 +2422,9 @@ elif page == "Risk Factor Analysis":
         "tool wear exceeds 200 minutes."
     )
 
-
     tool_col1, tool_col2 = st.columns(
         [1.4, 1]
     )
-
 
     with tool_col1:
 
@@ -2077,7 +2434,6 @@ elif page == "Risk Factor Analysis":
             y="Failure Rate (%)"
         )
 
-
     with tool_col2:
 
         st.dataframe(
@@ -2085,7 +2441,6 @@ elif page == "Risk Factor Analysis":
             width="stretch",
             hide_index=True
         )
-
 
     st.warning(
         """
@@ -2095,7 +2450,6 @@ elif page == "Risk Factor Analysis":
         observed across the lower tool-wear ranges.
         """
     )
-
 
     # ----------------------------------------------
     # TORQUE ANALYSIS
@@ -2112,11 +2466,9 @@ elif page == "Risk Factor Analysis":
         "are higher at both very low and very high torque levels."
     )
 
-
     torque_col1, torque_col2 = st.columns(
         [1.4, 1]
     )
-
 
     with torque_col1:
 
@@ -2126,7 +2478,6 @@ elif page == "Risk Factor Analysis":
             y="Failure Rate (%)"
         )
 
-
     with torque_col2:
 
         st.dataframe(
@@ -2134,7 +2485,6 @@ elif page == "Risk Factor Analysis":
             width="stretch",
             hide_index=True
         )
-
 
     st.warning(
         """
@@ -2144,7 +2494,6 @@ elif page == "Risk Factor Analysis":
         ranges had considerably lower failure rates.
         """
     )
-
 
     # ----------------------------------------------
     # ROTATIONAL SPEED ANALYSIS
@@ -2161,11 +2510,9 @@ elif page == "Risk Factor Analysis":
         "rates at the extremes rather than a simple linear pattern."
     )
 
-
     speed_col1, speed_col2 = st.columns(
         [1.4, 1]
     )
-
 
     with speed_col1:
 
@@ -2175,7 +2522,6 @@ elif page == "Risk Factor Analysis":
             y="Failure Rate (%)"
         )
 
-
     with speed_col2:
 
         st.dataframe(
@@ -2183,7 +2529,6 @@ elif page == "Risk Factor Analysis":
             width="stretch",
             hide_index=True
         )
-
 
     st.warning(
         """
@@ -2193,7 +2538,6 @@ elif page == "Risk Factor Analysis":
         The middle speed ranges showed much lower failure rates.
         """
     )
-
 
     # ----------------------------------------------
     # PRODUCT TYPE ANALYSIS
@@ -2210,11 +2554,9 @@ elif page == "Risk Factor Analysis":
         "quality categories represented in the dataset."
     )
 
-
     product_col1, product_col2 = st.columns(
         [1.4, 1]
     )
-
 
     with product_col1:
 
@@ -2224,7 +2566,6 @@ elif page == "Risk Factor Analysis":
             y="Failure Rate (%)"
         )
 
-
     with product_col2:
 
         st.dataframe(
@@ -2233,7 +2574,6 @@ elif page == "Risk Factor Analysis":
             hide_index=True
         )
 
-
     st.info(
         """
         **Historical insight:** Type L had the highest observed
@@ -2241,7 +2581,6 @@ elif page == "Risk Factor Analysis":
         **2.77%** and Type H at **2.09%**.
         """
     )
-
 
     # ----------------------------------------------
     # BI INTERPRETATION
@@ -2270,7 +2609,6 @@ elif page == "Risk Factor Analysis":
         """
     )
 
-
     st.success(
         """
         **Decision-support implication**
@@ -2288,331 +2626,52 @@ elif page == "Risk Factor Analysis":
 # ==================================================
 
 elif page == "Validation & Limitations":
-
-    page_header(
-        "Validation & Limitations",
-        "Evaluate the prototype maintenance-alert workflow using the held-out test set and review its limitations.",
-        "Model Validation"
-    )
-
-    st.info(
-        """
-        **Why this page matters**
-
-        The Risk Monitor demonstrates how the application can score
-        and prioritize machine records, but it includes records from
-        the full historical dataset.
-
-        This validation page instead reports results from the
-        **1,000-record held-out test set**, providing a more appropriate
-        evaluation of how the model performed on unseen records.
-        """
-    )
-
-    st.divider()
-
-    # ----------------------------------------------
-    # VALIDATION OVERVIEW
-    # ----------------------------------------------
-
-    st.subheader(
-        "Held-Out Test Validation"
-    )
-
-    st.write(
-        "The prototype maintenance alert uses the selected "
-        "**40% failure-probability threshold**."
-    )
-
-    validation_col1, validation_col2, validation_col3, validation_col4 = (
-        st.columns(4)
-    )
-
-    with validation_col1:
-
-        st.metric(
-            "True Negatives",
-            "951",
-            help="Normal records correctly left without an alert."
-        )
-
-    with validation_col2:
-
-        st.metric(
-            "False Positives",
-            "15",
-            help="Normal records that incorrectly generated an alert."
-        )
-
-    with validation_col3:
-
-        st.metric(
-            "False Negatives",
-            "6",
-            help="Actual failures that did not generate an alert."
-        )
-
-    with validation_col4:
-
-        st.metric(
-            "True Positives",
-            "28",
-            help="Actual failures correctly flagged by the system."
-        )
-
-    st.divider()
-
-    # ----------------------------------------------
-    # MAINTENANCE-ALERT PERFORMANCE
-    # ----------------------------------------------
-
-    st.subheader(
-        "Maintenance-Alert Performance"
-    )
-
-    performance_col1, performance_col2, performance_col3 = (
-        st.columns(3)
-    )
-
-    with performance_col1:
-
-        st.metric(
-            "Actual Failures",
-            "34"
-        )
-
-    with performance_col2:
-
-        st.metric(
-            "Failures Detected",
-            "28 / 34"
-        )
-
-    with performance_col3:
-
-        st.metric(
-            "Failure Recall",
-            "82.35%"
-        )
-
-    st.success(
-        """
-        **Validation result**
-
-        At the 40% prototype maintenance-alert threshold, the system
-        detected **28 of the 34 actual failures** in the held-out test
-        set, corresponding to **82.35% recall**.
-
-        The system missed **6 actual failures** and generated
-        **15 false maintenance alerts**.
-        """
-    )
-
-    st.caption(
-        "These results evaluate the 40% maintenance-alert decision "
-        "rule. They are different from the Random Forest metrics shown "
-        "at the standard 50% classification threshold."
-    )
-
-    st.divider()
-
-    # ----------------------------------------------
-    # LOAD DETAILED VALIDATION RESULTS
-    # ----------------------------------------------
-
-    st.subheader(
-        "Validation Case Examples"
-    )
-
-    try:
-
-        validation_results = pd.read_csv(
-            "application_validation_results.csv"
-        )
-
-        validation_order = [
-            "True Positive",
-            "False Negative",
-            "False Positive",
-            "True Negative"
-        ]
-
-        selected_validation_case = st.selectbox(
-            "Select Validation Outcome",
-            validation_order
-        )
-
-        case_results = validation_results[
-            validation_results[
-                "Validation Result"
-            ] == selected_validation_case
-        ].copy()
-
-        case_results = case_results.sort_values(
-            "Failure Probability (%)",
-            ascending=False
-        )
-
-        st.write(
-            f"Showing **{len(case_results):,}** "
-            f"{selected_validation_case} records."
-        )
-
-        display_columns = [
-            "UDI",
-            "Product ID",
-            "Type",
-            "Air temperature [K]",
-            "Process temperature [K]",
-            "Rotational speed [rpm]",
-            "Torque [Nm]",
-            "Tool wear [min]",
-            "Machine failure",
-            "Failure Probability (%)",
-            "Predicted Alert",
-            "Validation Result"
-        ]
-
-        st.dataframe(
-            case_results[display_columns],
-            width="stretch",
-            hide_index=True
-        )
-
-        if selected_validation_case == "True Positive":
-
-            st.success(
-                "These are actual machine failures that the prototype "
-                "correctly identified for maintenance attention."
-            )
-
-        elif selected_validation_case == "False Negative":
-
-            st.error(
-                "These are actual machine failures that the prototype "
-                "missed. They demonstrate why the system should support, "
-                "not replace, engineering inspection and maintenance "
-                "judgment."
-            )
-
-        elif selected_validation_case == "False Positive":
-
-            st.warning(
-                "These records did not fail but generated maintenance "
-                "alerts. In practice, false alarms can increase "
-                "inspection effort and maintenance cost."
-            )
-
-        else:
-
-            st.info(
-                "These are normal records that were correctly left "
-                "without a maintenance alert."
-            )
-
-    except (FileNotFoundError, OSError):
-
-        st.warning(
-            "The detailed validation file "
-            "'application_validation_results.csv' could not be loaded. "
-            "Run 14_application_validation.py to create it."
-        )
-
-    st.divider()
-
-    # ----------------------------------------------
-    # LIMITATIONS
-    # ----------------------------------------------
-
-    st.subheader(
-        "Prototype Limitations"
-    )
-
-    st.warning(
-        """
-        **1. Some failures are still missed**
-
-        At the selected 40% threshold, **6 of 34 actual failures**
-        in the held-out test set did not generate a maintenance alert.
-        """
-    )
-
-    st.warning(
-        """
-        **2. False alarms still occur**
-
-        The prototype generated **15 false positive alerts** in the
-        held-out test set. A real maintenance system would need to
-        consider the cost of unnecessary inspection against the cost
-        of missed failures.
-        """
-    )
-
-    st.warning(
-        """
-        **3. The dataset is synthetic**
-
-        AI4I 2020 is a synthetic predictive-maintenance dataset.
-        Performance on this dataset does not establish performance
-        on a real manufacturing plant or a different machine system.
-        """
-    )
-
-    st.warning(
-        """
-        **4. The 40% threshold is experimental**
-
-        The threshold was selected from the current project analysis
-        because it produced the highest F1-score among the tested
-        thresholds while improving failure recall. It is not an
-        industrial maintenance standard.
-        """
-    )
-
-    st.warning(
-        """
-        **5. Real deployment requires further validation**
-
-        Before operational use, the model and alert threshold should
-        be evaluated using additional unseen real-world data,
-        maintenance costs, equipment-specific requirements, and
-        engineering expertise.
-        """
-    )
-
-    st.divider()
-
-    st.subheader(
-        "Business Intelligence Interpretation"
-    )
-
-    st.write(
-        """
-        The validation results demonstrate the trade-off involved in
-        predictive maintenance decision support. Lowering the alert
-        threshold from the conventional 50% level to the prototype
-        40% level increased the number of actual failures detected,
-        but also increased false alarms.
-
-        Therefore, the application should not be interpreted as an
-        autonomous maintenance decision maker. Its purpose is to
-        transform machine operating data and model predictions into
-        information that can help maintenance personnel prioritize
-        inspection and make more informed decisions.
-        """
-    )
-
-    st.success(
-        """
-        **Prototype conclusion**
-
-        The application combines machine-learning prediction,
-        threshold-based maintenance alerts, historical risk analysis,
-        database-backed machine records, fleet-level monitoring, and
-        held-out validation to support predictive-maintenance
-        decision making.
-        """
-    )
+    page_header("Validation & Limitations",
+                "Held-out test performance of the current LightGBM model and provisional 60% alert rule.",
+                "Model Validation")
+    st.info("The 1,000-record test set was not used to fit the model. "
+            "However, comparing thresholds on this same test set is exploratory; "
+            "a separate validation set is required for unbiased threshold selection.")
+    st.subheader("Maintenance Alert Evaluation — 60% Threshold")
+    a, b, c, d = st.columns(4)
+    a.metric("True Negatives", alert_evaluation["tn"])
+    b.metric("False Positives", alert_evaluation["fp"])
+    c.metric("False Negatives", alert_evaluation["fn"])
+    d.metric("True Positives", alert_evaluation["tp"])
+    a, b, c = st.columns(3)
+    a.metric("Failures Detected", f"{alert_evaluation['tp']} / {alert_evaluation['tp'] + alert_evaluation['fn']}")
+    b.metric("Recall", f"{alert_evaluation['recall']:.2%}")
+    c.metric("F1-score", f"{alert_evaluation['f1']:.2%}")
+    st.subheader("Validation Case Examples")
+    validation_results = df.loc[X_test.index, ["UDI", "Product ID", "Type",
+                                               "Air temperature [K]", "Process temperature [K]",
+                                               "Rotational speed [rpm]",
+                                               "Torque [Nm]", "Tool wear [min]", "Machine failure"]].copy()
+    validation_results["Failure Probability (%)"] = (y_prob * 100).round(2)
+    validation_results["Predicted Alert"] = ["YES" if p >= ALERT_THRESHOLD else "NO" for p in y_prob]
+    actual = y_test.to_numpy()
+    predicted = (y_prob >= ALERT_THRESHOLD).astype(int)
+    validation_results["Validation Result"] = [
+        "True Positive" if a == 1 and p == 1 else
+        "False Negative" if a == 1 else
+        "False Positive" if p == 1 else "True Negative"
+        for a, p in zip(actual, predicted)]
+    case_type = st.selectbox("Select Validation Outcome",
+                             ["True Positive", "False Negative", "False Positive", "True Negative"])
+    cases = validation_results[validation_results["Validation Result"] == case_type]
+    st.write(f"Showing **{len(cases)}** {case_type} records.")
+    st.dataframe(cases.sort_values("Failure Probability (%)", ascending=False),
+                 width="stretch", hide_index=True)
+    st.subheader("Prototype Limitations")
+    st.warning(f"The provisional 60% rule missed {alert_evaluation['fn']} actual failures "
+               f"and generated {alert_evaluation['fp']} false alarms in this test set.")
+    st.warning("AI4I 2020 is a synthetic dataset. These results do not demonstrate "
+               "reliability on real industrial equipment or live sensor data.")
+    st.warning("The threshold was compared using the test set, so its apparent "
+               "performance may be optimistic. Choose thresholds on validation data "
+               "and reserve an untouched test set for final evaluation.")
+    st.info("AI predictions are decision-support signals, not automatic maintenance orders. "
+            "A qualified engineer should review alerts before acting.")
 
 
 # ==================================================
@@ -2620,340 +2679,42 @@ elif page == "Validation & Limitations":
 # ==================================================
 
 elif page == "Model Performance":
-
-    page_header(
-        "Model Performance",
-        "Compare the machine-failure prediction models evaluated using the same 90/10 train-test split.",
-        "AI Evaluation"
-    )
-
-    st.divider()
-
-
-    # ----------------------------------------------
-    # MODEL COMPARISON
-    # ----------------------------------------------
-
-    st.subheader(
-        "Model Comparison"
-    )
-
-
-    model_comparison = pd.DataFrame(
-        {
-            "Model": [
-                "Decision Tree",
-                "LightGBM",
-                "Class-Weighted LightGBM",
-                "Interpretable LightGBM",
-                "Random Forest"
-            ],
-
-            "Accuracy (%)": [
-                96.10,
-                97.60,
-                95.00,
-                98.90,
-                98.00
-            ],
-
-            "Precision (%)": [
-                42.86,
-                75.00,
-                36.21,
-                89.66,
-                73.33
-            ],
-
-            "Recall (%)": [
-                44.12,
-                44.12,
-                61.76,
-                76.47,
-                64.71
-            ],
-
-            "F1-score (%)": [
-                43.48,
-                55.56,
-                45.65,
-                82.54,
-                68.75
-            ]
-        }
-    )
-
-
-    st.dataframe(
-        model_comparison,
-        width="stretch",
-        hide_index=True
-    )
-
-
-    # ----------------------------------------------
-    # DEPLOYED MODEL
-    # ----------------------------------------------
-
-    st.divider()
-
-    st.subheader(
-        "Deployed Prediction Model"
-    )
-
-
-    st.info(
-        """
-        **Random Forest** is currently used as the prediction
-        engine in the prototype application.
-
-        The interpretable LightGBM experiment achieved the
-        strongest overall evaluation results, but Random Forest
-        is used for the live Streamlit prototype because of
-        runtime compatibility with the current application
-        environment.
-        """
-    )
-
-
-    metric1, metric2, metric3, metric4 = (
-        st.columns(4)
-    )
-
-
-    with metric1:
-
-        st.metric(
-            "Accuracy",
-            "98.00%"
-        )
-
-
-    with metric2:
-
-        st.metric(
-            "Precision",
-            "73.33%"
-        )
-
-
-    with metric3:
-
-        st.metric(
-            "Recall",
-            "64.71%"
-        )
-
-
-    with metric4:
-
-        st.metric(
-            "F1-score",
-            "68.75%"
-        )
-
-
-    # ----------------------------------------------
-    # CONFUSION MATRIX
-    # ----------------------------------------------
-
-    st.divider()
-
-    st.subheader(
-        "Random Forest Confusion Matrix"
-    )
-
-
-    confusion_results = pd.DataFrame(
-        {
-            "Measure": [
-                "True Negatives",
-                "False Positives",
-                "False Negatives",
-                "True Positives"
-            ],
-
-            "Count": [
-                958,
-                8,
-                12,
-                22
-            ],
-
-            "Meaning": [
-                "Normal machines correctly identified",
-                "Normal machines incorrectly flagged as failures",
-                "Actual failures missed by the model",
-                "Actual failures correctly detected"
-            ]
-        }
-    )
-
-
-    st.dataframe(
-        confusion_results,
-        width="stretch",
-        hide_index=True
-    )
-
-
-    st.warning(
-        """
-        At the standard 50% classification threshold,
-        the test set contained 34 actual machine failures.
-        Random Forest correctly detected 22 and missed 12.
-
-        Because missed failures are important in predictive
-        maintenance, threshold analysis was performed to improve
-        failure detection.
-        """
-    )
-
-
-    # ----------------------------------------------
-    # THRESHOLD ANALYSIS
-    # ----------------------------------------------
-
-    st.divider()
-
-    st.subheader(
-        "Maintenance Alert Threshold Analysis"
-    )
-
-    st.write(
-        "Different probability thresholds were tested to examine "
-        "the trade-off between detecting actual failures and "
-        "generating false maintenance alarms."
-    )
-
-
-    threshold_results = pd.DataFrame(
-        {
-            "Threshold (%)": [
-                50,
-                40,
-                30,
-                20,
-                10
-            ],
-
-            "Failures Detected": [
-                22,
-                28,
-                30,
-                30,
-                31
-            ],
-
-            "Failures Missed": [
-                12,
-                6,
-                4,
-                4,
-                3
-            ],
-
-            "False Alarms": [
-                8,
-                15,
-                30,
-                57,
-                93
-            ],
-
-            "Precision (%)": [
-                73.33,
-                65.12,
-                50.00,
-                34.48,
-                25.00
-            ],
-
-            "Recall (%)": [
-                64.71,
-                82.35,
-                88.24,
-                88.24,
-                91.18
-            ],
-
-            "F1-score (%)": [
-                68.75,
-                72.73,
-                63.83,
-                49.59,
-                39.24
-            ]
-        }
-    )
-
-
-    st.dataframe(
-        threshold_results,
-        width="stretch",
-        hide_index=True
-    )
-
-
-    st.success(
-        """
-        **Selected Prototype Threshold: 40%**
-
-        The 40% threshold achieved the highest F1-score
-        (**72.73%**) among the tested thresholds.
-
-        It detected **28 of 34 actual failures**, giving
-        **82.35% recall**, while generating **15 false alarms**.
-
-        Therefore, 40% was selected as the prototype
-        maintenance-alert threshold.
-        """
-    )
-
-
-    st.caption(
-        "The 40% threshold is an experimental prototype setting, "
-        "not a validated industrial maintenance standard. "
-        "A real deployment would require validation using "
-        "additional unseen operational data and maintenance-cost "
-        "information."
-    )
-
-
-    # ----------------------------------------------
-    # LIGHTGBM FEATURE IMPORTANCE
-    # ----------------------------------------------
-
-    st.divider()
-
-    st.subheader(
-        "Additional LightGBM Analysis"
-    )
-
-    st.write(
-        "The interpretable LightGBM experiment achieved the "
-        "strongest overall performance. Its feature-importance "
-        "analysis identified Torque, Tool Wear, and Rotational "
-        "Speed as the most influential predictive variables."
-    )
-
-
-    try:
-
-        st.image(
-            "lightgbm_feature_importance.png",
-            caption=(
-                "Feature Importance from the "
-                "Interpretable LightGBM Experiment"
-            ),
-            width="stretch"
-        )
-
-    except (FileNotFoundError, OSError):
-
-        st.warning(
-            "Feature importance image could not be loaded."
-        )
+    page_header("Model Performance",
+                "Metrics computed from the currently deployed LightGBM model.",
+                "AI Evaluation")
+    st.subheader("Deployed Prediction Model: LightGBM")
+    st.info("The application uses a class-weighted LightGBM classifier. "
+            "The metrics below are calculated from the current 90/10 split, "
+            "not copied from earlier Random Forest experiments.")
+    a, b, c, d = st.columns(4)
+    a.metric("Accuracy (50%)", f"{standard_evaluation['accuracy']:.2%}")
+    b.metric("Precision (50%)", f"{standard_evaluation['precision']:.2%}")
+    c.metric("Recall (50%)", f"{standard_evaluation['recall']:.2%}")
+    d.metric("F1-score (50%)", f"{standard_evaluation['f1']:.2%}")
+    st.subheader("LightGBM Confusion Matrix — 50% Threshold")
+    st.dataframe(pd.DataFrame({"Measure": ["True Negatives", "False Positives",
+                                           "False Negatives", "True Positives"],
+                               "Count": [standard_evaluation[k] for k in ["tn", "fp", "fn", "tp"]]}),
+                 width="stretch", hide_index=True)
+    st.subheader("Exploratory Threshold Comparison")
+    threshold_table = pd.DataFrame([{
+        "Threshold (%)": int(round(r["threshold"] * 100)),
+        "Failures Detected": r["tp"], "Failures Missed": r["fn"],
+        "False Alarms": r["fp"],
+        "Precision (%)": round(r["precision"] * 100, 2),
+        "Recall (%)": round(r["recall"] * 100, 2),
+        "F1-score (%)": round(r["f1"] * 100, 2)}
+        for r in threshold_evaluations])
+    st.dataframe(threshold_table, width="stretch", hide_index=True)
+    st.info(f"The application currently uses a provisional {ALERT_THRESHOLD:.0%} "
+            "maintenance-alert threshold. Its test-set comparison is exploratory "
+            "and should not be treated as independent threshold validation.")
+    st.subheader("LightGBM Feature Importance — Current Model")
+    importance = pd.DataFrame({"Feature": X_train.columns,
+                               "Importance": model.feature_importances_})
+    st.bar_chart(importance.set_index("Feature").sort_values("Importance", ascending=False))
+    st.caption("Built-in LightGBM feature importance is model-specific and does not "
+               "establish causation.")
 
 
 # ==================================================
@@ -2968,15 +2729,12 @@ elif page == "Machine Data":
         "Database"
     )
 
-
     st.metric(
         "Database Records",
         f"{len(df):,}"
     )
 
-
     st.divider()
-
 
     selected_type = st.selectbox(
         "Filter by Product Type",
@@ -2988,7 +2746,6 @@ elif page == "Machine Data":
         ]
     )
 
-
     if selected_type == "All":
 
         filtered_df = df
@@ -2997,13 +2754,11 @@ elif page == "Machine Data":
 
         filtered_df = df[
             df["Type"] == selected_type
-        ]
-
+            ]
 
     st.write(
         f"Showing **{len(filtered_df):,}** records."
     )
-
 
     st.dataframe(
         filtered_df,
