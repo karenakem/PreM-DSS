@@ -5,6 +5,10 @@ from pathlib import Path
 import base64
 from datetime import datetime, timezone
 
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+
 APP_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = APP_DIR / "predictive_maintenance.db"
 
@@ -2010,27 +2014,43 @@ elif page == "Live Monitoring":
         except (sqlite3.Error, pd.errors.DatabaseError):
             return pd.DataFrame()
 
-    replay_df = load_replay_observations(database_signature())
+
+    # Use all 10,000 historical AI4I observations
+    replay_df = df[[
+        "UDI",
+        "Product ID",
+        "Type",
+        "Air temperature [K]",
+        "Process temperature [K]",
+        "Rotational speed [rpm]",
+        "Torque [Nm]",
+        "Tool wear [min]",
+        "Machine failure"
+    ]].rename(columns={
+        "UDI": "id",
+        "Product ID": "product_id",
+        "Type": "product_type",
+        "Air temperature [K]": "air_temperature",
+        "Process temperature [K]": "process_temperature",
+        "Rotational speed [rpm]": "rotational_speed",
+        "Torque [Nm]": "torque",
+        "Tool wear [min]": "tool_wear",
+        "Machine failure": "actual_failure"
+    }).copy()
+
+    st.caption(
+        "Replay source: Complete AI4I dataset "
+        "(10,000 historical observations)."
+    )
 
     required_replay_columns = [
-        "product_type", "air_temperature", "process_temperature",
-        "rotational_speed", "torque", "tool_wear"
+        "product_type",
+        "air_temperature",
+        "process_temperature",
+        "rotational_speed",
+        "torque",
+        "tool_wear"
     ]
-    if replay_df.empty or not all(c in replay_df.columns for c in required_replay_columns):
-        replay_df = df[[
-            "UDI", "Product ID", "Type", "Air temperature [K]",
-            "Process temperature [K]", "Rotational speed [rpm]",
-            "Torque [Nm]", "Tool wear [min]"
-        ]].rename(columns={
-            "UDI": "id", "Product ID": "product_id", "Type": "product_type",
-            "Air temperature [K]": "air_temperature",
-            "Process temperature [K]": "process_temperature",
-            "Rotational speed [rpm]": "rotational_speed",
-            "Torque [Nm]": "torque", "Tool wear [min]": "tool_wear"
-        }).copy()
-        st.caption("Replay source: AI4I machine_data table (historical observations).")
-    else:
-        st.caption("Replay source: realtime_monitoring SQLite table (stored historical observations).")
 
     replay_df = replay_df.dropna(subset=required_replay_columns).reset_index(drop=True)
     if replay_df.empty:
@@ -2054,9 +2074,59 @@ elif page == "Live Monitoring":
         replay_probabilities = score_replay_observations(database_signature(), replay_features)
         replay_df["failure_probability"] = replay_probabilities * 100
         replay_df["risk_level"] = [risk_category(p) for p in replay_df["failure_probability"]]
+        # ------------------------------------------
+        # MAINTENANCE ALERT RULES
+        # ------------------------------------------
+
+        # Rule 1: Original single-observation alert
         replay_df["maintenance_alert"] = [
-            "YES" if p >= ALERT_THRESHOLD else "NO" for p in replay_probabilities
+            "YES" if p >= ALERT_THRESHOLD else "NO"
+            for p in replay_probabilities
         ]
+
+        # Rule 2: Sustained alert
+        # Requires 3 consecutive high-risk observations
+
+        replay_df["high_risk_observation"] = (
+                replay_df["failure_probability"] >= ALERT_THRESHOLD * 100
+        )
+
+        replay_df["sustained_alert"] = (
+            replay_df["high_risk_observation"]
+            .rolling(window=3, min_periods=3)
+            .sum()
+            .eq(3)
+        )
+
+        replay_df["sustained_maintenance_alert"] = (
+            replay_df["sustained_alert"]
+            .map({True: "YES", False: "NO"})
+        )
+
+
+        # Compare AI alerts with actual recorded failures
+        def classify_prediction(row):
+            predicted_failure = row["failure_probability"] >= ALERT_THRESHOLD * 100
+            actual_failure = row["actual_failure"] == 1
+
+            if predicted_failure and actual_failure:
+                return "True Positive"
+            elif predicted_failure and not actual_failure:
+                return "False Positive"
+            elif not predicted_failure and actual_failure:
+                return "False Negative"
+            else:
+                return "True Negative"
+
+
+        replay_df["prediction_outcome"] = replay_df.apply(
+            classify_prediction,
+            axis=1
+        )
+
+        print("\nPREDICTION OUTCOME SUMMARY")
+        print(replay_df["prediction_outcome"].value_counts())
+        print("Total classified:", len(replay_df))
 
         # All state belongs to the current Streamlit browser session.
         if "factory_step" not in st.session_state:
@@ -2099,7 +2169,7 @@ elif page == "Live Monitoring":
                 st.session_state.factory_skip_first_tick = False
         with control4:
             speed_seconds = st.selectbox(
-                "Seconds per observation", [5, 10, 15], index=1,
+                "Seconds per observation", [1, 3, 5], index=0,
                 help="Automatic replay speed; one historical observation per interval."
             )
 
@@ -2157,27 +2227,410 @@ elif page == "Live Monitoring":
             else:
                 st.success("No maintenance alert for this observation.")
 
-            st.subheader("Monitoring Charts (Replay Step, Not Actual Time)")
-            chart_history = visible.tail(100).copy()
+            # ------------------------------------------
+            # SUSTAINED ALERT COMPARISON
+            # ------------------------------------------
+
+            st.write("#### Maintenance Alert Comparison")
+
+            alert_col1, alert_col2 = st.columns(2)
+
+            with alert_col1:
+                st.metric(
+                    "Original Alert (Single Observation)",
+                    current["maintenance_alert"]
+                )
+
+            with alert_col2:
+                st.metric(
+                    "Sustained Alert (3 Consecutive)",
+                    current["sustained_maintenance_alert"]
+                )
+
+            if current["sustained_alert"]:
+                st.error(
+                    "CONFIRMED SUSTAINED WARNING — "
+                    "Three consecutive observations have exceeded "
+                    "the 60% failure probability threshold."
+                )
+
+            elif current["maintenance_alert"] == "YES":
+                st.warning(
+                    "HIGH-RISK OBSERVATION — The original alert "
+                    "threshold has been reached, but the sustained "
+                    "warning condition has not been met."
+                )
+
+            st.caption(
+                "Experimental comparison using historical AI4I "
+                "observations. Consecutive dataset rows are not "
+                "verified sequential measurements of one machine."
+            )
+
+            st.subheader("Central Machine Failure Monitoring")
+
+            graph_view = st.radio(
+                "Graph View",
+                ["Live Window (Last 100)", "Full Dataset (10,000)"],
+                horizontal=True,
+                key="factory_graph_view"
+            )
+
+            if graph_view == "Full Dataset (10,000)":
+                chart_history = replay_df.copy()
+
+                chart_history["moving_average_5"] = (
+                    chart_history["failure_probability"]
+                    .rolling(window=5, min_periods=1)
+                    .mean()
+                )
+
+
+
+            else:
+
+                chart_history = visible.tail(100).copy()
+
+                chart_history["moving_average_5"] = (
+
+                    visible["failure_probability"]
+
+                    .rolling(window=5, min_periods=1)
+
+                    .mean()
+
+                    .loc[chart_history.index]
+
+                )
+
+            # Use observation numbers for the horizontal axis
+            chart_history["observation_number"] = (
+                    chart_history.index + 1
+            )
+
+            st.caption(
+                f"Displaying {len(chart_history):,} of "
+                f"{len(replay_df):,} historical observations. "
+                "Red dots indicate recorded machine failures."
+            )
+
+            # Create the central monitoring graph
+            fig = go.Figure()
+
+            # Green line: predicted failure probability
+            fig.add_trace(go.Scatter(
+                x=chart_history["observation_number"],
+                y=chart_history["failure_probability"],
+                mode="lines",
+                name="Predicted Failure Probability",
+                line=dict(color="#16A34A", width=2)
+            ))
+
+            # Red line: moving average
+            fig.add_trace(go.Scatter(
+                x=chart_history["observation_number"],
+                y=chart_history["moving_average_5"],
+                mode="lines",
+                name="5-Observation Moving Average",
+                line=dict(color="#2563EB", width=2)
+            ))
+
+            # Red dots: actual machine failures
+            actual_failures = chart_history[
+                chart_history["actual_failure"] == 1
+                ]
+
+            fig.add_trace(go.Scatter(
+                x=actual_failures["observation_number"],
+                y=actual_failures["failure_probability"],
+                mode="markers",
+                name="Actual Machine Failure",
+                marker=dict(
+                    color="#DC2626",
+                    size=12,
+                    symbol="circle",
+                    line=dict(color="white", width=2)
+                )
+            ))
+
+            # ------------------------------------------
+            # SUSTAINED WARNING MARKERS
+            # ------------------------------------------
+
+            sustained_points = chart_history[
+                chart_history["sustained_alert"]
+            ]
+
+            fig.add_trace(go.Scatter(
+                x=sustained_points["observation_number"],
+                y=sustained_points["failure_probability"],
+                mode="markers",
+                name="Sustained Warning (3 Observations)",
+                marker=dict(
+                    color="#F59E0B",
+                    size=13,
+                    symbol="diamond",
+                    line=dict(color="#92400E", width=2)
+                )
+            ))
+
+            # ------------------------------------------
+            # HIGHLIGHT IMMEDIATE ALERT OBSERVATIONS
+            # ------------------------------------------
+
+            alert_points = chart_history[
+                chart_history["maintenance_alert"] == "YES"
+            ]
+
+            for observation in alert_points["observation_number"]:
+                fig.add_vrect(
+                    x0=observation - 0.45,
+                    x1=observation + 0.45,
+                    fillcolor="#F59E0B",
+                    opacity=0.15,
+                    line_width=0,
+                    layer="below"
+                )
+
+                # ------------------------------------------
+                # GRAPH LEGEND EXPLANATIONS
+                # ------------------------------------------
+
+                # Legend entry for immediate alert shading
+                fig.add_trace(go.Scatter(
+                    x=[None],
+                    y=[None],
+                    mode="markers",
+                    name="Orange Shading: Immediate Alert",
+                    marker=dict(
+                        symbol="square",
+                        size=12,
+                        color="#F59E0B",
+                        opacity=0.35
+                    ),
+                    showlegend=True
+                ))
+
+                # Legend entry for the 60% threshold
+                fig.add_trace(go.Scatter(
+                    x=[None],
+                    y=[None],
+                    mode="lines",
+                    name="Alert Threshold (60%)",
+                    line=dict(
+                        color="#D69E2E",
+                        dash="dash",
+                        width=2
+                    ),
+                    showlegend=True
+                ))
+
+            # Maintenance alert threshold
+            fig.add_hline(
+                y=ALERT_THRESHOLD * 100,
+                line_dash="dash",
+                line_color="#D69E2E",
+                annotation_text="Alert Threshold (60%)"
+            )
+
+            fig.update_layout(
+                title=None,
+                xaxis_title="Observation Number (Not Actual Time)",
+                yaxis_title="Failure Probability (%)",
+                yaxis=dict(range=[0, 100]),
+                hovermode="x unified",
+                height=450,
+                legend=dict(orientation="h", y=-0.25),
+                margin=dict(l=20, r=20, t=60, b=80)
+            )
+            st.subheader("Machine Failure Probability Monitoring")
+
+            st.plotly_chart(
+                fig,
+                width="stretch",
+                key="factory_failure_probability_chart"
+            )
+
+            # ------------------------------------------
+            # COMPARISON OF MAINTENANCE ALERT RULES
+            # ------------------------------------------
+
+
+            # ------------------------------------------
+            # INTERACTIVE ALERT THRESHOLD EXPERIMENT
+            # ------------------------------------------
+
+            st.subheader("Interactive Alert Threshold Experiment")
+
+            experiment_threshold = st.slider(
+                "Experimental alert threshold (%)",
+                min_value=20,
+                max_value=90,
+                value=60,
+                step=5,
+                key="experimental_alert_threshold",
+                help="Explore different thresholds without changing the operational 60% rule."
+            )
+
+            st.caption(
+                "This slider changes only the experimental comparison. "
+                "The original 60% maintenance alert remains unchanged."
+            )
+
+
+            # ------------------------------------------
+            # EXPERIMENTAL THRESHOLD EVALUATION
+            # ------------------------------------------
+
+            experiment_predictions = (
+                replay_df["failure_probability"] >= experiment_threshold
+            )
+
+            experiment_actual = replay_df["actual_failure"] == 1
+
+            exp_tp = int(
+                (experiment_predictions & experiment_actual).sum()
+            )
+
+            exp_fp = int(
+                (experiment_predictions & ~experiment_actual).sum()
+            )
+
+            exp_fn = int(
+                (~experiment_predictions & experiment_actual).sum()
+            )
+
+            exp_tn = int(
+                (~experiment_predictions & ~experiment_actual).sum()
+            )
+
+            exp_precision = (
+                exp_tp / (exp_tp + exp_fp)
+                if (exp_tp + exp_fp) > 0 else 0
+            )
+
+            exp_recall = (
+                exp_tp / (exp_tp + exp_fn)
+                if (exp_tp + exp_fn) > 0 else 0
+            )
+
+            st.write(
+                f"#### Results at {experiment_threshold}% Threshold"
+            )
+
+            e1, e2, e3, e4 = st.columns(4)
+
+            e1.metric("Detected Failures", exp_tp)
+            e2.metric("Missed Failures", exp_fn)
+            e3.metric("False Alarms", exp_fp)
+            e4.metric("Correct Normal", exp_tn)
+
+            e5, e6 = st.columns(2)
+
+            e5.metric("Precision", f"{exp_precision:.2%}")
+            e6.metric("Recall", f"{exp_recall:.2%}")
+
+            st.caption(
+                "Exploratory results from all 10,000 AI4I records, "
+                "including training observations. These are not "
+                "independent test-set performance estimates."
+            )
+
+
+
+            st.subheader("Maintenance Alert Rule Comparison")
+
+            actual_failures = replay_df["actual_failure"].eq(1)
+
+            def evaluate_alert_rule(alert_column):
+                predicted_alerts = replay_df[alert_column].eq("YES")
+
+                tp = int((predicted_alerts & actual_failures).sum())
+                fp = int((predicted_alerts & ~actual_failures).sum())
+                fn = int((~predicted_alerts & actual_failures).sum())
+                tn = int((~predicted_alerts & ~actual_failures).sum())
+
+                precision = tp / (tp + fp) if (tp + fp) else 0
+                recall = tp / (tp + fn) if (tp + fn) else 0
+
+                return {
+                    "Detected Failures": tp,
+                    "Missed Failures": fn,
+                    "False Alarms": fp,
+                    "Correct Normal": tn,
+                    "Precision (%)": round(precision * 100, 2),
+                    "Recall (%)": round(recall * 100, 2)
+                }
+
+            original_results = evaluate_alert_rule(
+                "maintenance_alert"
+            )
+
+            sustained_results = evaluate_alert_rule(
+                "sustained_maintenance_alert"
+            )
+
+            comparison_df = pd.DataFrame(
+                {
+                    "Original Rule (60%)": original_results,
+                    "Sustained Rule (3 Observations)": sustained_results
+                }
+            )
+
+            st.dataframe(
+                comparison_df,
+                width="stretch"
+            )
+
+            st.caption(
+                "Exploratory comparison using the complete AI4I dataset. "
+                "This includes training observations and is not an "
+                "independent performance evaluation. Consecutive rows "
+                "are not verified time-series measurements of one machine."
+            )
+
+            st.subheader("AI Alert Outcome Summary")
+
+            outcome_counts = replay_df["prediction_outcome"].value_counts()
+
+            tp = int(outcome_counts.get("True Positive", 0))
+            fn = int(outcome_counts.get("False Negative", 0))
+            fp = int(outcome_counts.get("False Positive", 0))
+            tn = int(outcome_counts.get("True Negative", 0))
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            col1.metric("Detected Failures", tp)
+            col2.metric("Missed Failures", fn)
+            col3.metric("False Alarms", fp)
+            col4.metric("Correct Normal", tn)
+
+            st.caption(
+                "Exploratory results across all 10,000 historical observations. "
+                "These include training records and must not be interpreted "
+                "as independent test-set performance."
+            )
+
+            st.markdown("#### What Do These Results Mean?")
+
+            st.info(
+                f"At the {ALERT_THRESHOLD:.0%} alert threshold, "
+                f"the AI correctly flagged {tp:,} recorded failures "
+                f"and missed {fn:,}. "
+                f"It also generated {fp:,} false alarms. "
+                "A maintenance engineer should review alerts and "
+                "machine operating conditions before deciding what action to take."
+            )
+
+            st.caption(
+                "These counts describe the complete historical dataset, "
+                "including training observations. They do not measure "
+                "independent test-set performance."
+            )
+
             chart_history.index = range(position + 2 - len(chart_history), position + 2)
             chart_history.index.name = "Replay Step"
-            st.line_chart(chart_history[["failure_probability"]].rename(
-                columns={"failure_probability": "Failure Probability (%)"}
-            ))
-            left_chart, right_chart = st.columns(2)
-            with left_chart:
-                st.line_chart(chart_history[["air_temperature", "process_temperature"]].rename(
-                    columns={"air_temperature": "Air Temp (K)",
-                             "process_temperature": "Process Temp (K)"}
-                ))
-                st.line_chart(chart_history[["rotational_speed"]].rename(
-                    columns={"rotational_speed": "Rotational Speed (rpm)"}
-                ))
-            with right_chart:
-                st.line_chart(chart_history[["torque"]].rename(columns={"torque": "Torque (Nm)"}))
-                st.line_chart(chart_history[["tool_wear"]].rename(
-                    columns={"tool_wear": "Tool Wear (min)"}
-                ))
+
 
             st.subheader("Maintenance Engineer Review")
             st.caption(
