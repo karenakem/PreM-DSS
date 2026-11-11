@@ -2392,38 +2392,7 @@ elif page == "Live Monitoring":
                     layer="below"
                 )
 
-                # ------------------------------------------
-                # GRAPH LEGEND EXPLANATIONS
-                # ------------------------------------------
-
-                # Legend entry for immediate alert shading
-                fig.add_trace(go.Scatter(
-                    x=[None],
-                    y=[None],
-                    mode="markers",
-                    name="Orange Shading: Immediate Alert",
-                    marker=dict(
-                        symbol="square",
-                        size=12,
-                        color="#F59E0B",
-                        opacity=0.35
-                    ),
-                    showlegend=True
-                ))
-
-                # Legend entry for the 60% threshold
-                fig.add_trace(go.Scatter(
-                    x=[None],
-                    y=[None],
-                    mode="lines",
-                    name="Alert Threshold (60%)",
-                    line=dict(
-                        color="#D69E2E",
-                        dash="dash",
-                        width=2
-                    ),
-                    showlegend=True
-                ))
+               
 
             # Maintenance alert threshold
             fig.add_hline(
@@ -2432,6 +2401,37 @@ elif page == "Live Monitoring":
                 line_color="#D69E2E",
                 annotation_text="Alert Threshold (60%)"
             )
+
+            # ------------------------------------------
+            # GRAPH LEGEND — ADD ONLY ONCE
+            # ------------------------------------------
+
+            fig.add_trace(go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                name="Orange Shading: Immediate Alert",
+                marker=dict(
+                    symbol="square",
+                    size=12,
+                    color="#F59E0B",
+                    opacity=0.35
+                ),
+                showlegend=True
+            ))
+
+            fig.add_trace(go.Scatter(
+                x=[None],
+                y=[None],
+                mode="lines",
+                name="Alert Threshold (60%)",
+                line=dict(
+                    color="#D69E2E",
+                    dash="dash",
+                    width=2
+                ),
+                showlegend=True
+            ))
 
             fig.update_layout(
                 title=None,
